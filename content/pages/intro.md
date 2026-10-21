@@ -1,3 +1,3 @@
-I'm Pragadeesh. I build [NodusDB](https://github.com/Pragadeesh-19/nodusdb), an embedded database for Python that keeps live state in memory and writes its log to your own S3 bucket as an Iceberg table. One log gives you the replicas, the history and the analytics, with no server in between.
+I'm Pragadeesh. I'm building [NodusDB](https://github.com/Pragadeesh-19/nodusdb), an embedded database for Python. It keeps its state in memory and can ship its log to an S3 bucket, where the same log is also an Iceberg table.
 
-This is where I write down how it works and what went wrong along the way. You can try it with `pip install nodusdb`.
+I write here about how it works and what goes wrong while I build it. To try it: `pip install nodusdb`.

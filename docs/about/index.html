@@ -3,12 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
 <title>About | Building NodusDB</title>
 <meta name="description" content="Who writes this blog, and what NodusDB is.">
 <link rel="canonical" href="https://pragadeesh-19.github.io/about/">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="alternate" type="application/atom+xml" title="Building NodusDB" href="/feed.xml">
-<link rel="stylesheet" href="/style.css?v=81ff29d9">
+<link rel="stylesheet" href="/style.css?v=9ab1a846">
 <meta property="og:site_name" content="Building NodusDB">
 <meta property="og:type" content="website">
 <meta property="og:title" content="About">
@@ -28,7 +29,7 @@
 <div class="wrap header-row">
 <a class="brand" href="/">Building NodusDB</a>
 <nav aria-label="Main">
-<a href="/">Writing</a>
+<a href="/">Essays</a>
 <a href="/about/" aria-current="page">About</a>
 <a href="https://github.com/Pragadeesh-19/nodusdb">GitHub</a>
 <a href="/feed.xml">RSS</a>
@@ -36,21 +37,20 @@
 </div>
 </header>
 <main id="main" class="wrap">
-<article class="post"><h1>About</h1><p>I'm Pragadeesh, and I live in London. I like problems where the textbook answer is &quot;add another server&quot;, because that is usually where the interesting answer is hiding.</p>
+<article class="post"><h1>About</h1><p>I'm Pragadeesh, and I live in London.</p>
 <h2 id="what-i-m-building">What I'm building<a class="anchor" href="#what-i-m-building" aria-label="Link to this section">#</a></h2>
-<p><a href="https://github.com/Pragadeesh-19/nodusdb">NodusDB</a> is an embedded database for Python. You <code>pip install nodusdb</code> and it runs inside your process, with no server and no JVM to install. It holds live state in memory, so a read costs microseconds. Every change goes into one ordered log, and that log is shipped to object storage as a signed chain and as an Iceberg table, so replicas, history and analytics all come from the same place.</p>
-<p>The engine is written in Java, compiled with GraalVM Native Image into one shared library, and the only dependency it has is the JDK. It is open source under the Apache License 2.0. Every design decision is written down in the repository with its reason, and the essays here are the longer versions of those notes.</p>
-<h2 id="where-i-come-from">Where I come from<a class="anchor" href="#where-i-come-from" aria-label="Link to this section">#</a></h2>
+<p><a href="https://github.com/Pragadeesh-19/nodusdb">NodusDB</a> is an embedded database for Python. You install it with <code>pip install nodusdb</code> and it runs inside your process, with no server and no JVM to install. It holds its state in memory, so a read takes microseconds. Every change goes into one ordered log. The log can be shipped to object storage as a signed chain, and the same log is written out as an Iceberg table, so replicas, history and analytics all read from it.</p>
+<p>The engine is written in Java and compiled with GraalVM Native Image into one shared library. Its only dependency is the JDK. It is open source under the Apache License 2.0, and every design decision is written down in the repository with its reason.</p>
+<h2 id="background">Background<a class="anchor" href="#background" aria-label="Link to this section">#</a></h2>
 <p>I studied for a master's in Advanced Computer Science at the University of Leeds. During the course I was the founding tech and workflow intern at Scrubbing Squad, a pre-revenue startup. After that I was a research assistant at the Centre for Human-Inspired AI (CHIA) at the University of Cambridge, where I built a multimodal data ingestion pipeline that turns raw material from under-resourced languages into ML-ready datasets. Its beta is live and is working on Quechua languages.</p>
 <p>Then I started NodusDB.</p>
-<h2 id="get-in-touch">Get in touch<a class="anchor" href="#get-in-touch" aria-label="Link to this section">#</a></h2>
-<p>The best place is <a href="https://github.com/Pragadeesh-19/nodusdb/discussions">GitHub Discussions</a>. If you hit a problem, open an <a href="https://github.com/Pragadeesh-19/nodusdb/issues">issue</a>. If you want to build something hard on top of a fast, honest database core, the open problems are listed in <a href="https://github.com/Pragadeesh-19/nodusdb/blob/main/TODOS.md"><code>TODOS.md</code></a>.</p>
+<h2 id="contact">Contact<a class="anchor" href="#contact" aria-label="Link to this section">#</a></h2>
+<p>Open an <a href="https://github.com/Pragadeesh-19/nodusdb/issues">issue</a> on the repository, or look at <a href="https://github.com/Pragadeesh-19/nodusdb/blob/main/TODOS.md"><code>TODOS.md</code></a> for the open problems.</p>
 </article>
 </main>
 <footer class="site-footer">
 <div class="wrap">
-<p>NodusDB is open source under the Apache License 2.0. <a href="https://github.com/Pragadeesh-19/nodusdb">Source</a> &middot; <a href="https://pypi.org/project/nodusdb/">PyPI</a> &middot; <a href="/feed.xml">RSS</a></p>
-<p>Pragadeesh, London.</p>
+<p>Pragadeesh, London. NodusDB is open source under the Apache License 2.0: <a href="https://github.com/Pragadeesh-19/nodusdb">source</a>, <a href="https://pypi.org/project/nodusdb/">PyPI</a>.</p>
 </div>
 </footer>
 

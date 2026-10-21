@@ -109,10 +109,6 @@ def render_markdown(body):
     return out
 
 
-def reading_minutes(body):
-    words = len(re.findall(r"\w+", re.sub(r"```.*?```", "", body, flags=re.S)))
-    return max(1, round(words / 230))
-
 
 def format_date(date):
     return f"{date.day} {date.strftime('%B %Y')}"
@@ -150,7 +146,6 @@ def load_posts(include_drafts):
             "draft": draft,
             "body": body,
             "html": render_markdown(body),
-            "minutes": reading_minutes(body),
             "path": f"/posts/{meta['slug']}/",
         })
     posts.sort(key=lambda p: p["date"], reverse=True)
@@ -182,6 +177,7 @@ def head(title, description, path, kind="website", image=None, published=None):
         ld["datePublished"] = published.isoformat()
     return f"""<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
 <title>{html.escape(full_title)}</title>
 <meta name="description" content="{html.escape(description)}">
 <link rel="canonical" href="{page_url}">
@@ -218,7 +214,7 @@ def layout(title, description, path, body, kind="website", image=None, published
 <div class="wrap header-row">
 <a class="brand" href="/">{html.escape(SITE['title'])}</a>
 <nav aria-label="Main">
-{nav('Writing', '/', 'home')}
+{nav('Essays', '/', 'home')}
 {nav('About', '/about/', 'about')}
 <a href="{SITE['github']}">GitHub</a>
 <a href="/feed.xml">RSS</a>
@@ -230,8 +226,7 @@ def layout(title, description, path, body, kind="website", image=None, published
 </main>
 <footer class="site-footer">
 <div class="wrap">
-<p>NodusDB is open source under the Apache License 2.0. <a href="{SITE['github']}">Source</a> &middot; <a href="{SITE['pypi']}">PyPI</a> &middot; <a href="/feed.xml">RSS</a></p>
-<p>{html.escape(SITE['author'])}, London.</p>
+<p>{html.escape(SITE['author'])}, London. NodusDB is open source under the Apache License 2.0: <a href="{SITE['github']}">source</a>, <a href="{SITE['pypi']}">PyPI</a>.</p>
 </div>
 </footer>
 {SITE.get('analytics_snippet', '')}
@@ -242,12 +237,12 @@ def layout(title, description, path, body, kind="website", image=None, published
 
 def post_list(posts):
     if not posts:
-        return '<p class="muted">The first essay is on its way.</p>'
+        return "<p>The first essay is coming.</p>"
     items = []
     for post in posts:
         items.append(
             f'<li class="post-item"><a class="post-link" href="{post["path"]}">{html.escape(post["title"])}</a>'
-            f'<p class="post-meta">{format_date(post["date"])} &middot; {post["minutes"]} min read</p>'
+            f'<p class="post-meta"><time datetime="{post["date"].isoformat()}">{format_date(post["date"])}</time></p>'
             f'<p>{html.escape(post["description"])}</p></li>'
         )
     return '<ul class="post-list">' + "".join(items) + "</ul>"
@@ -255,7 +250,7 @@ def post_list(posts):
 
 def build_home(posts):
     intro = render_markdown(read_text(CONTENT / "pages" / "intro.md"))
-    body = f'<section class="intro">{intro}</section><h2 class="section-title">Writing</h2>{post_list(posts)}'
+    body = f'<section class="intro">{intro}</section><h2 class="section-title">Essays</h2>{post_list(posts)}'
     return layout(SITE["title"], SITE["description"], "/", body, active="home")
 
 
@@ -269,11 +264,10 @@ def build_page(name, active):
 def build_post(post):
     article = (
         f'<article class="post"><header class="post-head"><h1>{html.escape(post["title"])}</h1>'
-        f'<p class="post-meta">{html.escape(SITE["author"])} &middot; {format_date(post["date"])} &middot; {post["minutes"]} min read</p></header>'
+        f'<p class="post-meta">{html.escape(SITE["author"])}, <time datetime="{post["date"].isoformat()}">{format_date(post["date"])}</time></p></header>'
         f'{post["html"]}'
-        f'<footer class="post-foot"><p>Questions, corrections and arguments are welcome in '
-        f'<a href="{SITE["github"]}/discussions">GitHub Discussions</a> or as an '
-        f'<a href="{SITE["github"]}/issues">issue</a>.</p></footer></article>'
+        f'<footer class="post-foot"><p>Corrections and questions are welcome as an '
+        f'<a href="{SITE["github"]}/issues">issue on GitHub</a>.</p></footer></article>'
     )
     return layout(post["title"], post["description"], post["path"], article, "article", post["image"], post["date"])
 
@@ -325,10 +319,7 @@ def build_sitemap(posts):
 
 
 def style_css():
-    base = (STATIC / "style.css").read_text(encoding="utf-8")
-    light = HtmlFormatter(style="default").get_style_defs(".code")
-    dark = HtmlFormatter(style="github-dark").get_style_defs(".code")
-    return f"{base}\n{light}\n@media (prefers-color-scheme: dark) {{\n{dark}\n}}\n"
+    return (STATIC / "style.css").read_text(encoding="utf-8")
 
 
 def write(path, text):
