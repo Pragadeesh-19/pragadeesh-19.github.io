@@ -98,13 +98,6 @@ MARKDOWN = make_markdown()
 
 def render_markdown(body):
     out = MARKDOWN.render(body)
-    out = re.sub(
-        r'<h([23]) id="([^"]+)">(.*?)</h\1>',
-        lambda m: f'<h{m.group(1)} id="{m.group(2)}">{m.group(3)}'
-                  f'<a class="anchor" href="#{m.group(2)}" aria-label="Link to this section">#</a></h{m.group(1)}>',
-        out,
-        flags=re.S,
-    )
     out = out.replace("<table>", '<div class="table-wrap"><table>').replace("</table>", "</table></div>")
     return out
 
@@ -198,37 +191,20 @@ def head(title, description, path, kind="website", image=None, published=None):
 <script type="application/ld+json">{json.dumps(ld)}</script>"""
 
 
-def layout(title, description, path, body, kind="website", image=None, published=None, active=""):
-    def nav(label, href, key):
-        current = ' aria-current="page"' if active == key else ""
-        return f'<a href="{href}"{current}>{label}</a>'
-
+def layout(title, description, path, body, kind="website", image=None, published=None, home=False):
+    site_tag = "h1" if home else "p"
     return f"""<!doctype html>
 <html lang="{SITE.get('language', 'en')}">
 <head>
 {head(title, description, path, kind, image, published)}
 </head>
 <body>
-<a class="skip" href="#main">Skip to content</a>
-<header class="site-header">
-<div class="wrap header-row">
-<a class="brand" href="/">{html.escape(SITE['title'])}</a>
-<nav aria-label="Main">
-{nav('Essays', '/', 'home')}
-{nav('About', '/about/', 'about')}
-<a href="{SITE['github']}">GitHub</a>
-<a href="/feed.xml">RSS</a>
-</nav>
-</div>
-</header>
-<main id="main" class="wrap">
+<{site_tag} class="site"><a href="/">{html.escape(SITE['title'])}</a></{site_tag}>
+<p class="nav"><a href="/">Essays</a> | <a href="/about/">About</a> | <a href="{SITE['github']}">GitHub</a></p>
+<hr>
 {body}
-</main>
-<footer class="site-footer">
-<div class="wrap">
-<p>{html.escape(SITE['author'])}, London. NodusDB is open source under the Apache License 2.0: <a href="{SITE['github']}">source</a>, <a href="{SITE['pypi']}">PyPI</a>.</p>
-</div>
-</footer>
+<hr>
+<p class="foot">{html.escape(SITE['author'])}, London.</p>
 {SITE.get('analytics_snippet', '')}
 </body>
 </html>
@@ -241,39 +217,37 @@ def post_list(posts):
     items = []
     for post in posts:
         items.append(
-            f'<li class="post-item"><a class="post-link" href="{post["path"]}">{html.escape(post["title"])}</a>'
-            f'<p class="post-meta"><time datetime="{post["date"].isoformat()}">{format_date(post["date"])}</time></p>'
-            f'<p>{html.escape(post["description"])}</p></li>'
+            f'<li><a href="{post["path"]}">{html.escape(post["title"])}</a>, '
+            f'<time datetime="{post["date"].isoformat()}">{format_date(post["date"])}</time><br>'
+            f'{html.escape(post["description"])}</li>'
         )
-    return '<ul class="post-list">' + "".join(items) + "</ul>"
+    return "<ul>" + "".join(items) + "</ul>"
 
 
 def build_home(posts):
     intro = render_markdown(read_text(CONTENT / "pages" / "intro.md"))
-    body = f'<section class="intro">{intro}</section><h2 class="section-title">Essays</h2>{post_list(posts)}'
-    return layout(SITE["title"], SITE["description"], "/", body, active="home")
+    body = f"{intro}<h2>Essays</h2>{post_list(posts)}"
+    return layout(SITE["title"], SITE["description"], "/", body, home=True)
 
 
-def build_page(name, active):
+def build_page(name, active=""):
     meta, body = split_front_matter(CONTENT / "pages" / f"{name}.md")
-    content = render_markdown(body)
-    page_html = f'<article class="post"><h1>{html.escape(meta["title"])}</h1>{content}</article>'
-    return layout(meta["title"], meta["description"], f"/{name}/", page_html, active=active)
+    page_html = f'<h1>{html.escape(meta["title"])}</h1>{render_markdown(body)}'
+    return layout(meta["title"], meta["description"], f"/{name}/", page_html)
 
 
 def build_post(post):
     article = (
-        f'<article class="post"><header class="post-head"><h1>{html.escape(post["title"])}</h1>'
-        f'<p class="post-meta">{html.escape(SITE["author"])}, <time datetime="{post["date"].isoformat()}">{format_date(post["date"])}</time></p></header>'
+        f'<h1>{html.escape(post["title"])}</h1>'
+        f'<p><i>{html.escape(SITE["author"])}, <time datetime="{post["date"].isoformat()}">{format_date(post["date"])}</time></i></p>'
         f'{post["html"]}'
-        f'<footer class="post-foot"><p>Corrections and questions are welcome as an '
-        f'<a href="{SITE["github"]}/issues">issue on GitHub</a>.</p></footer></article>'
+        f'<hr><p>Corrections and questions are welcome as an <a href="{SITE["github"]}/issues">issue on GitHub</a>.</p>'
     )
     return layout(post["title"], post["description"], post["path"], article, "article", post["image"], post["date"])
 
 
 def build_404():
-    body = '<article class="post"><h1>Page not found</h1><p>That page does not exist. Try the <a href="/">list of essays</a>.</p></article>'
+    body = '<h1>Page not found</h1><p>That page does not exist. Try the <a href="/">list of essays</a>.</p>'
     return layout("Page not found", "That page does not exist.", "/404.html", body)
 
 

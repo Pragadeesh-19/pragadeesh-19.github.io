@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Every memory read cost 300 nanoseconds | Building NodusDB</title>
+<meta name="description" content="How a GraalVM native image made my database&#x27;s writes 40 times slower, why the compiler team had already fixed it, and what I measured when I tried the fix.">
+<link rel="canonical" href="https://pragadeesh-19.github.io/posts/every-memory-read-cost-300-nanoseconds/">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="alternate" type="application/atom+xml" title="Building NodusDB" href="/feed.xml">
+<link rel="stylesheet" href="/style.css?v=455b503b">
+<meta property="og:site_name" content="Building NodusDB">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Every memory read cost 300 nanoseconds">
+<meta property="og:description" content="How a GraalVM native image made my database&#x27;s writes 40 times slower, why the compiler team had already fixed it, and what I measured when I tried the fix.">
+<meta property="og:url" content="https://pragadeesh-19.github.io/posts/every-memory-read-cost-300-nanoseconds/">
+<meta property="og:image" content="https://pragadeesh-19.github.io/img/og-300ns.png">
+<meta property="article:published_time" content="2026-10-21">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Every memory read cost 300 nanoseconds">
+<meta name="twitter:description" content="How a GraalVM native image made my database&#x27;s writes 40 times slower, why the compiler team had already fixed it, and what I measured when I tried the fix.">
+<meta name="twitter:image" content="https://pragadeesh-19.github.io/img/og-300ns.png">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "BlogPosting", "headline": "Every memory read cost 300 nanoseconds", "description": "How a GraalVM native image made my database's writes 40 times slower, why the compiler team had already fixed it, and what I measured when I tried the fix.", "url": "https://pragadeesh-19.github.io/posts/every-memory-read-cost-300-nanoseconds/", "image": "https://pragadeesh-19.github.io/img/og-300ns.png", "author": {"@type": "Person", "name": "Pragadeesh"}, "datePublished": "2026-10-21"}</script>
+</head>
+<body>
+<p class="site"><a href="/">Building NodusDB</a></p>
+<p class="nav"><a href="/">Essays</a> | <a href="/about/">About</a> | <a href="https://github.com/Pragadeesh-19/nodusdb">GitHub</a></p>
+<hr>
+<h1>Every memory read cost 300 nanoseconds</h1><p><i>Pragadeesh, <time datetime="2026-10-21">21 October 2026</time></i></p><p><em>How a GraalVM native image made my database's writes 40 times slower, why the compiler team had already fixed it, and what I measured when I tried the fix.</em></p>
+<p>On 20 October I re-ran a benchmark I had stopped looking at. My README said the lake engine in NodusDB ingested 846,137 rows a second. The release sitting on PyPI did 21,017.</p>
+<p>Same laptop. Same benchmark. Forty times slower.</p>
+<p>This is the story of where those nanoseconds went. It is also the story of a mistake I made before I wrote any of the fix: I didn't check whether someone had already found the problem. Someone had.</p>
+<h2 id="what-nodusdb-is-in-two-paragraphs">What NodusDB is, in two paragraphs</h2>
+<p>NodusDB is an embedded database for Python. You <code>pip install nodusdb</code> and it runs inside your process, with no server to start. It has two engines. A graph engine holds relationships in memory and answers traversals and permission checks in microseconds. A lake engine takes streaming upserts and writes them out as Parquet files that DuckDB, Spark and PyArrow can read.</p>
+<p>The engine is written in Java and compiled ahead of time with GraalVM Native Image into one shared library. Python calls it through <code>ctypes</code>. There is no JVM in your process and nothing to install beyond the wheel.</p>
+<h2 id="the-change-that-caused-it">The change that caused it</h2>
+<p>In early October I moved the lake's columns out of Java arrays and into native memory, using the <code>java.lang.foreign</code> API: <code>MemorySegment</code>, arenas, value layouts. I had good reasons. Native memory doesn't move under you, so one day the columns can be handed to Arrow without a copy. The garbage collector has nothing to scan. And I can count every byte against a memory budget and refuse a write before it happens.</p>
+<p>Every test passed. On a plain JVM the same Java code still ran an upsert in about 300 ns, so the benchmarks I was watching looked fine. The graph kernel got the same treatment, and its tests passed too.</p>
+<p>Then 0.1.0 shipped. On 20 October I rewrote the README and re-ran everything against the wheel people actually install:</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Measure</th>
+<th style="text-align:right">README said</th>
+<th style="text-align:right">0.1.0 measured</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Lake ingest, rows a second</td>
+<td style="text-align:right">846,137</td>
+<td style="text-align:right">21,017</td>
+</tr>
+<tr>
+<td>Flush of 250,000 rows to Parquet</td>
+<td style="text-align:right">0.265 s</td>
+<td style="text-align:right">9.924 s</td>
+</tr>
+<tr>
+<td>Sum of 1,000,000 rows in memory</td>
+<td style="text-align:right">4.0 ms</td>
+<td style="text-align:right">922.6 ms</td>
+</tr>
+</tbody>
+</table></div>
+<p>The old numbers were real. They described an implementation that no longer existed. I had shipped a release with figures from before the change.</p>
+<h2 id="rule-one-measure-the-primitive">Rule one: measure the primitive</h2>
+<p>The tempting move is to start redesigning. Maybe the arenas were wrong. Maybe the scope checks were expensive. Maybe the compiler had regressed.</p>
+<p>I ruled out the compiler first. A library I had built on 7 October with an older GraalVM was just as slow. Then I stopped guessing and wrote small programs, each one doing a single thing a million times and built as a native image with the library's own flags.</p>
+<p>Here is the cleaned-up version of those probes: <a href="/files/MemorySegmentRead.java">one file with no dependencies</a> that reads a million longs six ways and prints the cost of one read. I ran it on GraalVM Community Edition 25.0.2, the compiler my wheels are built with, first on the JVM and then as a native image.</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>One read, in nanoseconds</th>
+<th style="text-align:right">JVM</th>
+<th style="text-align:right">Native image</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MemorySegment.getAtIndex(JAVA_LONG, i)</code></td>
+<td style="text-align:right">1.8</td>
+<td style="text-align:right">249</td>
+</tr>
+<tr>
+<td><code>MemorySegment.get(JAVA_LONG_UNALIGNED, offset)</code></td>
+<td style="text-align:right">2.5</td>
+<td style="text-align:right">287</td>
+</tr>
+<tr>
+<td>A <code>static final VarHandle</code> from <code>JAVA_LONG.varHandle()</code></td>
+<td style="text-align:right">1.9</td>
+<td style="text-align:right">273</td>
+</tr>
+<tr>
+<td><code>MemorySegment.copy</code> into a <code>long[]</code>, 4,096 at a time</td>
+<td style="text-align:right">6.9</td>
+<td style="text-align:right">2.0</td>
+</tr>
+<tr>
+<td><code>ByteBuffer.asLongBuffer().get(i)</code></td>
+<td style="text-align:right">1.9</td>
+<td style="text-align:right">6.9</td>
+</tr>
+<tr>
+<td>A plain <code>long[]</code></td>
+<td style="text-align:right">0.9</td>
+<td style="text-align:right">1.1</td>
+</tr>
+</tbody>
+</table></div>
+<p>Reading one long through a <code>MemorySegment</code> cost 250 to 290 nanoseconds in the native image. On the JVM it cost about two. (In my first probes, with the library's own build flags, it came out nearer 300, which is where the title comes from.) In those earlier probes it made no difference where the memory came from: an auto arena, a global one, a shared one, a confined one, a raw address, even a segment wrapping a heap array.</p>
+<p>Everything that went through an accessor was slow. Everything that moved a block of memory in one go was fine.</p>
+<p>That also explained the graph. Its adjacency lives in the same kind of native memory, read through the same calls. A build from 3 October that still kept the graph in Java arrays inserted 1.06 to 1.30 million edges a second. The 0.1.0 wheel did 162,689.</p>
+<h2 id="i-went-to-report-it-it-was-already-fixed">I went to report it. It was already fixed.</h2>
+<p>On 21 October I sat down to write the bug report. First I did what I should have done a day earlier: I searched the GraalVM issue tracker.</p>
+<p>It was there, twice. <a href="https://github.com/oracle/graal/issues/13825">Issue 13825</a>, closed in June, was titled &quot;scalar MemorySegment.get ~100x slower than HotSpot&quot;. <a href="https://github.com/oracle/graal/issues/13377">Issue 13377</a>, still open, measured 111 times. On the second, a GraalVM maintainer had replied that the problem &quot;should already have been fixed&quot; by a pull request, and that the change was &quot;not part of 25.0.2 so far&quot;. That is the release my wheels are built with.</p>
+<p>So my questions changed. Is it really fixed? In which release? Does my compiler have it? I downloaded the newest Community build, 25.4.4.1.1 from 22 September, and ran the same file on three compilers.</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Compiler</th>
+<th>Released</th>
+<th style="text-align:right">Native image, <code>getAtIndex</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GraalVM CE 25.0.2, the one my wheels use</td>
+<td>January 2026</td>
+<td style="text-align:right">249 ns</td>
+</tr>
+<tr>
+<td>Oracle GraalVM 25.0.4, the long-term-support line</td>
+<td>July 2026</td>
+<td style="text-align:right">170 ns</td>
+</tr>
+<tr>
+<td>GraalVM CE 25.4.4.1.1, an Innovation release</td>
+<td>September 2026</td>
+<td style="text-align:right">2.85 ns</td>
+</tr>
+</tbody>
+</table></div>
+<p><img src="/img/toolchains.png" alt="A bar chart of the cost of one MemorySegment read: 1.8 ns on the JVM, 249 ns in a native image built with CE 25.0.2, 170 ns with Oracle GraalVM 25.0.4 LTS, and 2.85 ns with CE 25.4.4.1.1." /></p>
+<p>The fix works. On the newest build a read costs 2.85 nanoseconds, about 90 times less than on 25.0.2. The long-term-support line has not picked it up: the July Oracle GraalVM LTS is faster than CE 25.0.2 but still about 60 times slower than the fixed build.</p>
+<p>I didn't file a bug. A duplicate would only have cost the maintainers time. If you are stuck on the 25.0.x line, the file above and this table are my evidence that it is still affected there.</p>
+<p>Why was it slow? The fix is <a href="https://github.com/oracle/graal/pull/13215">pull request 13215</a>, merged on 26 March, and its description explains it. What follows is my plain-English reading of that description, so any mistakes are mine.</p>
+<p>On the JVM, the JIT can treat the layout you pass to <code>get</code> as a constant, so the <code>VarHandle</code> behind it turns into a plain load. Native image does an early optimising pass before that can happen. At that point the layout is just a method parameter. The <code>VarHandle</code> also sits behind a lazily filled cache. And <code>MemorySegment.get</code> is an interface call with several implementations, which the compiler couldn't resolve to a single method. So no <code>VarHandle</code> ever became a load, and every read took the slow, general path. The fix teaches native image to resolve calls on a sealed hierarchy early, and marks <code>get</code> and <code>set</code> as places where a <code>VarHandle</code> access should be turned into a load.</p>
+<p>I wish I had read that before I started building. It would have told me where to look, and which compiler to try first.</p>
+<h2 id="what-i-did-about-it-on-20-october">What I did about it on 20 October</h2>
+<p>I did most of the next part before I knew any of this, and I'll tell it as it happened. It still matters, because the 25.0.x line is where many of us are stuck.</p>
+<h3 id="rule-two-a-library-must-not-crash-its-host">Rule two: a library must not crash its host</h3>
+<p>The fastest fix was obvious: read through raw pointers and skip the checks. GraalVM's <code>Pointer.readLong</code> cost 1.65 ns in my probe.</p>
+<p>But NodusDB runs inside someone else's Python process. If my code reads past the end of a buffer, it doesn't fail one query. It reads garbage from somewhere in their process, or takes the whole process down. So the fix had to keep every check: the offset in bounds, the arena still alive, the segment native and writable. A bad access has to throw an exception that the C layer turns into an error code.</p>
+<p>I ruled out two other routes. <code>sun.misc.Unsafe</code> is on its way out, and using it prints a warning to the user's stderr. Nobody wants a library that writes to their terminal. Bulk copies and buffer views everywhere would make random access slower, and buffer views top out at 2 GB.</p>
+<h3 id="one-door-into-native-memory">One door into native memory</h3>
+<p>Every read and write of native memory in NodusDB now goes through one class, <code>NativeMemory</code>, with two backends behind the same methods:</p>
+<pre class="code" data-language="java"><code><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="nf">getLong</span><span class="p">(</span><span class="n">MemorySegment</span><span class="w"> </span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">address</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">size</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">offset</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">POINTERS</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">address</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">NOT_NATIVE</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">offset</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">offset</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">size</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">Long</span><span class="p">.</span><span class="na">BYTES</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">throw</span><span class="w"> </span><span class="n">outOfBounds</span><span class="p">(</span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">Long</span><span class="p">.</span><span class="na">BYTES</span><span class="p">,</span><span class="w"> </span><span class="n">size</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">WordFactory</span><span class="p">.</span><span class="o">&lt;</span><span class="n">Pointer</span><span class="o">&gt;</span><span class="n">pointer</span><span class="p">(</span><span class="n">address</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">offset</span><span class="p">).</span><span class="na">readLong</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="w">        </span><span class="n">Reference</span><span class="p">.</span><span class="na">reachabilityFence</span><span class="p">(</span><span class="n">segment</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">value</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">Slow</span><span class="p">.</span><span class="na">getLong</span><span class="p">(</span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre>
+<p>On the JVM, <code>POINTERS</code> is false and the call goes to the normal segment accessor, checked by the JDK. In the native library it is a bounds check and a raw read. <code>reachabilityFence</code> keeps the segment, and so its memory, alive until the read is done.</p>
+<p><code>POINTERS</code> comes from a system property that native image sets both when it builds the image and when the image runs. The native build initializes <code>NativeMemory</code> at build time, so the flag becomes a constant and the dead branch disappears. A plain JDK never loads the GraalVM pointer code at all.</p>
+<p><img src="/img/native-memory-design.png" alt="A diagram of NativeMemory: callers pass a segment, address, size and offset to one accessor, which uses the JDK accessor on the JVM and a bounds check plus a pointer read in the native library." /></p>
+<h3 id="rule-three-know-what-your-compiler-will-inline">Rule three: know what your compiler will inline</h3>
+<p>My first version of that accessor was correct and still slow. A second finding explained why.</p>
+<p>On CE 25.0.2, GraalVM only inlines trivial methods: at most 20 nodes and one call, or 40 nodes for a leaf with no calls. An accessor with a bounds check and a fallback path is never trivial, so every read stays a real function call. How much that call costs depends on what the caller hands it. About 5.7 ns when the caller passes an address and size it has already cached. 20 to 25 ns when the accessor has to ask the segment for its address, size, liveness and kind on every call.</p>
+<p>So the owners of memory cache what the accessor needs. Each column keeps its address and size next to its segment and refreshes them when it grows. The graph kernel publishes its chunks as one immutable record of segments, addresses and sizes, so a lock-free reader always sees a consistent set. That also closed a race I hadn't seen: a reader could briefly see a grown chunk array before its new chunk was set.</p>
+<p>Loops that walk memory in order don't call the accessor per element at all. They copy 4,096 values at a time into a reused heap array with <code>MemorySegment.copy</code> (2 ns a value in the native image) and loop over the array. The Snappy compressor copies each page into a reused <code>byte[]</code> once and runs its match finder over plain heap arrays.</p>
+<h3 id="proving-nothing-else-changed">Proving nothing else changed</h3>
+<p>A faster writer that writes different bytes is a different writer. Before touching anything, I recorded the SHA-256 of every Parquet file the old writer produced: 132,000 rows through both ingest paths, with overwrites, deletes and new keys, under both codecs. A test now writes the same data and compares hashes. Changing one byte in the page sink fails it. The new files are byte-identical to the old ones.</p>
+<p>Two more guards keep this from coming back. A test reads the main sources and fails the build if anything but <code>NativeMemory</code> touches a segment accessor directly. And an exported function runs the accessor contract (bounds, closed arenas, read-only views, heap segments) inside the compiled library, which the Python suite calls.</p>
+<h2 id="what-a-fixed-compiler-is-worth">What a fixed compiler is worth</h2>
+<p>Now the question I couldn't answer on 20 October. If the compiler is fixed, was my workaround wasted? I built five variants and ran them back to back on one laptop in one session, twice each:</p>
+<ol>
+<li><strong>0.1.0 as released.</strong> The wheel from PyPI, built with CE 25.0.2.</li>
+<li><strong>0.1.0's source on the new compiler.</strong> Only the compiler changes, with CE 25.4.4.1.1.</li>
+<li><strong>0.1.1 as released.</strong> My workaround on the old compiler: the wheel from PyPI, CE 25.0.2.</li>
+<li><strong>0.1.1's source on the new compiler, with the pointer path switched off.</strong> Plain segment accessors, but every other change I made.</li>
+<li><strong>0.1.1's source on the new compiler, as shipped.</strong> My workaround on the fixed compiler.</li>
+</ol>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Variant</th>
+<th style="text-align:right">Graph inserts a second</th>
+<th style="text-align:right">Lake rows a second</th>
+<th style="text-align:right">Flush, 250,000 rows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1. 0.1.0, CE 25.0.2</td>
+<td style="text-align:right">166,000</td>
+<td style="text-align:right">51,500</td>
+<td style="text-align:right">13.1 s</td>
+</tr>
+<tr>
+<td>2. 0.1.0 code, CE 25.4</td>
+<td style="text-align:right">552,000</td>
+<td style="text-align:right">157,000</td>
+<td style="text-align:right">1.71 s</td>
+</tr>
+<tr>
+<td>3. 0.1.1, CE 25.0.2</td>
+<td style="text-align:right">569,000</td>
+<td style="text-align:right">1,608,000</td>
+<td style="text-align:right">0.34 s</td>
+</tr>
+<tr>
+<td>4. 0.1.1 code, CE 25.4, pointers off</td>
+<td style="text-align:right">520,000</td>
+<td style="text-align:right">662,000</td>
+<td style="text-align:right">0.67 s</td>
+</tr>
+<tr>
+<td>5. 0.1.1, CE 25.4</td>
+<td style="text-align:right">691,000</td>
+<td style="text-align:right">2,329,000</td>
+<td style="text-align:right">0.27 s</td>
+</tr>
+</tbody>
+</table></div>
+<p>One laptop, one session, each variant run twice and averaged. The two runs agreed within about 10 percent. Rows 1 and 3 are the released wheels. Rows 2, 4 and 5 are local builds of the same commits. The graph column is one million inserts through <code>compare.py</code>. The lake columns come from <code>lake_native_probe.py</code>, one Arrow batch of 250,000 rows, a smaller test than the taxi benchmark above, so its absolute numbers differ. The laptop also ran slower in this session than on the day I fixed it. Compare rows with each other, not with earlier numbers.</p>
+<p>Here is what I read from it.</p>
+<ul>
+<li><strong>For the graph, the compiler fix does most of the work.</strong> Row 2 inserts 552,000 edges a second with no change to my code. My workaround on the old compiler (row 3) reached 569,000.</li>
+<li><strong>For the lake, it does not.</strong> Row 2 ingests 157,000 rows a second against 1.6 million for my workaround. The scalar accessor is no longer the slow part of that code, but something else is, and I haven't profiled what.</li>
+<li><strong>On the new compiler, my workaround still pays.</strong> With the pointer path off (row 4), the same code ingests 662,000 rows a second and flushes in 0.67 s. With it on (row 5): 2.3 million and 0.27 s. In the small reproducer plain access costs 2.85 ns, so I don't yet understand why it is still this far behind in the real code.</li>
+<li><strong>The new compiler makes the workaround faster too.</strong> Row 5 against row 3, same code: 22 percent more graph inserts, 45 percent more ingest, 21 percent less time to flush.</li>
+</ul>
+<p>I haven't moved the released wheels to the new compiler. The 25.x Innovation releases move faster than the 25.0.x line, and I have been burned by a compiler change before: a local build with GraalVM CE 23 ran one call about 130 times slower than CE 22, and I wrote down &quot;time a new toolchain before you trust it&quot;. So the order is test first, then switch. The whole test suite and the speed gate need to pass on it.</p>
+<h2 id="what-i-d-tell-myself-on-20-october">What I'd tell myself on 20 October</h2>
+<p><strong>Search the tracker before you debug, then try the newest release before you design anything.</strong> Ten minutes of searching and a 330 MB download would have told me the problem was known, that it was fixed, and which line of releases had the fix.</p>
+<p><strong>Measure the primitive before you redesign.</strong> A twenty-line program answers in an afternoon what a week of guessing about arenas won't.</p>
+<p><strong>A regression that can't show up on the JVM needs a test that runs the native library, and an alarm you did not calibrate on the broken build.</strong> I did have a speed gate in 0.1.0. I had set its limit at 30, twice the worst ratio I had measured, and what I had measured was the slow build. It passed. The new gate also times the lake and fails above 10. In CI the native library now runs within two times the JVM on every probe.</p>
+<p><strong>A number in a README is a claim.</strong> Re-run it against the artifact people actually install, every release.</p>
+<h2 id="try-it-or-help">Try it, or help</h2>
+<p>NodusDB is open source under Apache 2.0, and 0.1.1 is on PyPI for Linux, macOS and Windows.</p>
+<pre class="code" data-language="sh"><code>pip<span class="w"> </span>install<span class="w"> </span>nodusdb
+</code></pre>
+<p>The full engineering review, with every probe and decision, is in the repository: <a href="https://github.com/Pragadeesh-19/nodusdb">github.com/Pragadeesh-19/nodusdb</a>.</p>
+<p>Two questions I would like help with:</p>
+<ul>
+<li><strong>Where does native image still fall off a cliff when you use memory segments?</strong> With the compiler fixed, the 0.1.0 lake code is still ten times slower than my workaround, and I don't know why. If you know which calls native image still doesn't optimise, I'd like to hear about it.</li>
+<li><strong>Which compiler line should a library ship on?</strong> The long-term-support line has the bug and a longer life. The Innovation line has the fix and the speed. If you've made this choice for a native library, tell me how you decided.</li>
+</ul>
+<p>Next time: why NodusDB writes its database log straight into an Iceberg table, and what that makes possible.</p>
+<details>
+<summary>The reproducer, MemorySegmentRead.java</summary>
+<pre class="code" data-language="java"><code><span class="kn">import</span><span class="w"> </span><span class="nn">java.lang.foreign.Arena</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">java.lang.foreign.MemorySegment</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">java.lang.foreign.ValueLayout</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">java.lang.invoke.VarHandle</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">java.nio.ByteBuffer</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">java.nio.ByteOrder</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">java.nio.LongBuffer</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">java.util.Arrays</span><span class="p">;</span>
+
+<span class="kd">public</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kd">class</span> <span class="nc">MemorySegmentRead</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">LONGS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1_000_000</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">ROUNDS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">15</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">CHUNK</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4096</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">VarHandle</span><span class="w"> </span><span class="n">LAYOUT_HANDLE</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ValueLayout</span><span class="p">.</span><span class="na">JAVA_LONG</span><span class="p">.</span><span class="na">varHandle</span><span class="p">();</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">volatile</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">sink</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">interface</span> <span class="nc">Variant</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span><span class="n">MemorySegment</span><span class="w"> </span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">heap</span><span class="p">,</span><span class="w"> </span><span class="n">LongBuffer</span><span class="w"> </span><span class="n">view</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">scratch</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="nf">getAtIndex</span><span class="p">(</span><span class="n">MemorySegment</span><span class="w"> </span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">heap</span><span class="p">,</span><span class="w"> </span><span class="n">LongBuffer</span><span class="w"> </span><span class="n">view</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">scratch</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">sum</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">LONGS</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">sum</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">segment</span><span class="p">.</span><span class="na">getAtIndex</span><span class="p">(</span><span class="n">ValueLayout</span><span class="p">.</span><span class="na">JAVA_LONG</span><span class="p">,</span><span class="w"> </span><span class="n">i</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">sum</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="nf">getUnaligned</span><span class="p">(</span><span class="n">MemorySegment</span><span class="w"> </span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">heap</span><span class="p">,</span><span class="w"> </span><span class="n">LongBuffer</span><span class="w"> </span><span class="n">view</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">scratch</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">sum</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">LONGS</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">sum</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">segment</span><span class="p">.</span><span class="na">get</span><span class="p">(</span><span class="n">ValueLayout</span><span class="p">.</span><span class="na">JAVA_LONG_UNALIGNED</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="kt">long</span><span class="p">)</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">Long</span><span class="p">.</span><span class="na">BYTES</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">sum</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="nf">layoutVarHandle</span><span class="p">(</span><span class="n">MemorySegment</span><span class="w"> </span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">heap</span><span class="p">,</span><span class="w"> </span><span class="n">LongBuffer</span><span class="w"> </span><span class="n">view</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">scratch</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">sum</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">LONGS</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">sum</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="p">(</span><span class="kt">long</span><span class="p">)</span><span class="w"> </span><span class="n">LAYOUT_HANDLE</span><span class="p">.</span><span class="na">get</span><span class="p">(</span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="kt">long</span><span class="p">)</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">Long</span><span class="p">.</span><span class="na">BYTES</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">sum</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="nf">bulkCopy</span><span class="p">(</span><span class="n">MemorySegment</span><span class="w"> </span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">heap</span><span class="p">,</span><span class="w"> </span><span class="n">LongBuffer</span><span class="w"> </span><span class="n">view</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">scratch</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">sum</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">base</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">base</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">LONGS</span><span class="p">;</span><span class="w"> </span><span class="n">base</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">CHUNK</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="kt">int</span><span class="w"> </span><span class="n">count</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Math</span><span class="p">.</span><span class="na">min</span><span class="p">(</span><span class="n">CHUNK</span><span class="p">,</span><span class="w"> </span><span class="n">LONGS</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">base</span><span class="p">);</span>
+<span class="w">            </span><span class="n">MemorySegment</span><span class="p">.</span><span class="na">copy</span><span class="p">(</span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="n">ValueLayout</span><span class="p">.</span><span class="na">JAVA_LONG</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="kt">long</span><span class="p">)</span><span class="w"> </span><span class="n">base</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">Long</span><span class="p">.</span><span class="na">BYTES</span><span class="p">,</span><span class="w"> </span><span class="n">scratch</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">count</span><span class="p">);</span>
+<span class="w">            </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">count</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">sum</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">scratch</span><span class="o">[</span><span class="n">i</span><span class="o">]</span><span class="p">;</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">sum</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="nf">byteBufferView</span><span class="p">(</span><span class="n">MemorySegment</span><span class="w"> </span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">heap</span><span class="p">,</span><span class="w"> </span><span class="n">LongBuffer</span><span class="w"> </span><span class="n">view</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">scratch</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">sum</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">LONGS</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">sum</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">view</span><span class="p">.</span><span class="na">get</span><span class="p">(</span><span class="n">i</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">sum</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="nf">heapArray</span><span class="p">(</span><span class="n">MemorySegment</span><span class="w"> </span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">heap</span><span class="p">,</span><span class="w"> </span><span class="n">LongBuffer</span><span class="w"> </span><span class="n">view</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">scratch</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">sum</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">LONGS</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">sum</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">heap</span><span class="o">[</span><span class="n">i</span><span class="o">]</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">sum</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="n">String</span><span class="o">[]</span><span class="w"> </span><span class="n">args</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">        </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">heap</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="kt">long</span><span class="o">[</span><span class="n">LONGS</span><span class="o">]</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">LONGS</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">heap</span><span class="o">[</span><span class="n">i</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">long</span><span class="p">)</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mh">0x9E3779B97F4A7C15L</span><span class="p">;</span>
+<span class="w">            </span><span class="n">expected</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">heap</span><span class="o">[</span><span class="n">i</span><span class="o">]</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">scratch</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="kt">long</span><span class="o">[</span><span class="n">CHUNK</span><span class="o">]</span><span class="p">;</span>
+
+<span class="w">        </span><span class="n">String</span><span class="o">[]</span><span class="w"> </span><span class="n">names</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="s">&quot;MemorySegment.getAtIndex(JAVA_LONG, i)&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s">&quot;MemorySegment.get(JAVA_LONG_UNALIGNED, offset)&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s">&quot;static final VarHandle from JAVA_LONG.varHandle()&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s">&quot;MemorySegment.copy into long[] (4096 per call), then sum&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s">&quot;ByteBuffer.asLongBuffer().get(i)&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="s">&quot;long[] (control)&quot;</span>
+<span class="w">        </span><span class="p">};</span>
+<span class="w">        </span><span class="n">Variant</span><span class="o">[]</span><span class="w"> </span><span class="n">variants</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">MemorySegmentRead</span><span class="p">::</span><span class="n">getAtIndex</span><span class="p">,</span>
+<span class="w">            </span><span class="n">MemorySegmentRead</span><span class="p">::</span><span class="n">getUnaligned</span><span class="p">,</span>
+<span class="w">            </span><span class="n">MemorySegmentRead</span><span class="p">::</span><span class="n">layoutVarHandle</span><span class="p">,</span>
+<span class="w">            </span><span class="n">MemorySegmentRead</span><span class="p">::</span><span class="n">bulkCopy</span><span class="p">,</span>
+<span class="w">            </span><span class="n">MemorySegmentRead</span><span class="p">::</span><span class="n">byteBufferView</span><span class="p">,</span>
+<span class="w">            </span><span class="n">MemorySegmentRead</span><span class="p">::</span><span class="n">heapArray</span>
+<span class="w">        </span><span class="p">};</span>
+
+<span class="w">        </span><span class="n">System</span><span class="p">.</span><span class="na">out</span><span class="p">.</span><span class="na">println</span><span class="p">(</span><span class="s">&quot;java.vm.name = &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">System</span><span class="p">.</span><span class="na">getProperty</span><span class="p">(</span><span class="s">&quot;java.vm.name&quot;</span><span class="p">));</span>
+<span class="w">        </span><span class="n">System</span><span class="p">.</span><span class="na">out</span><span class="p">.</span><span class="na">println</span><span class="p">(</span><span class="s">&quot;java.version = &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">System</span><span class="p">.</span><span class="na">getProperty</span><span class="p">(</span><span class="s">&quot;java.version&quot;</span><span class="p">));</span>
+<span class="w">        </span><span class="n">System</span><span class="p">.</span><span class="na">out</span><span class="p">.</span><span class="na">println</span><span class="p">(</span><span class="s">&quot;imagecode    = &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">System</span><span class="p">.</span><span class="na">getProperty</span><span class="p">(</span><span class="s">&quot;org.graalvm.nativeimage.imagecode&quot;</span><span class="p">));</span>
+<span class="w">        </span><span class="n">System</span><span class="p">.</span><span class="na">out</span><span class="p">.</span><span class="na">println</span><span class="p">(</span><span class="s">&quot;longs per pass = &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">LONGS</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;, rounds = &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">ROUNDS</span><span class="p">);</span>
+<span class="w">        </span><span class="n">System</span><span class="p">.</span><span class="na">out</span><span class="p">.</span><span class="na">println</span><span class="p">();</span>
+
+<span class="w">        </span><span class="kt">boolean</span><span class="w"> </span><span class="n">ok</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="p">;</span>
+<span class="w">        </span><span class="k">try</span><span class="w"> </span><span class="p">(</span><span class="n">Arena</span><span class="w"> </span><span class="n">arena</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Arena</span><span class="p">.</span><span class="na">ofConfined</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">MemorySegment</span><span class="w"> </span><span class="n">segment</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">arena</span><span class="p">.</span><span class="na">allocate</span><span class="p">((</span><span class="kt">long</span><span class="p">)</span><span class="w"> </span><span class="n">LONGS</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">Long</span><span class="p">.</span><span class="na">BYTES</span><span class="p">,</span><span class="w"> </span><span class="n">Long</span><span class="p">.</span><span class="na">BYTES</span><span class="p">);</span>
+<span class="w">            </span><span class="n">MemorySegment</span><span class="p">.</span><span class="na">copy</span><span class="p">(</span><span class="n">heap</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="n">ValueLayout</span><span class="p">.</span><span class="na">JAVA_LONG</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">LONGS</span><span class="p">);</span>
+<span class="w">            </span><span class="n">ByteBuffer</span><span class="w"> </span><span class="n">buffer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">segment</span><span class="p">.</span><span class="na">asByteBuffer</span><span class="p">().</span><span class="na">order</span><span class="p">(</span><span class="n">ByteOrder</span><span class="p">.</span><span class="na">nativeOrder</span><span class="p">());</span>
+<span class="w">            </span><span class="n">LongBuffer</span><span class="w"> </span><span class="n">view</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">buffer</span><span class="p">.</span><span class="na">asLongBuffer</span><span class="p">();</span>
+
+<span class="w">            </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">variants</span><span class="p">.</span><span class="na">length</span><span class="p">;</span><span class="w"> </span><span class="n">v</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">nanos</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="kt">long</span><span class="o">[</span><span class="n">ROUNDS</span><span class="o">]</span><span class="p">;</span>
+<span class="w">                </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">round</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">round</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">ROUNDS</span><span class="p">;</span><span class="w"> </span><span class="n">round</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                    </span><span class="kt">long</span><span class="w"> </span><span class="n">start</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">System</span><span class="p">.</span><span class="na">nanoTime</span><span class="p">();</span>
+<span class="w">                    </span><span class="kt">long</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">variants</span><span class="o">[</span><span class="n">v</span><span class="o">]</span><span class="p">.</span><span class="na">run</span><span class="p">(</span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="n">heap</span><span class="p">,</span><span class="w"> </span><span class="n">view</span><span class="p">,</span><span class="w"> </span><span class="n">scratch</span><span class="p">);</span>
+<span class="w">                    </span><span class="n">nanos</span><span class="o">[</span><span class="n">round</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">System</span><span class="p">.</span><span class="na">nanoTime</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">start</span><span class="p">;</span>
+<span class="w">                    </span><span class="n">sink</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">result</span><span class="p">;</span>
+<span class="w">                    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">result</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">expected</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                        </span><span class="n">ok</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span><span class="p">;</span>
+<span class="w">                    </span><span class="p">}</span>
+<span class="w">                </span><span class="p">}</span>
+<span class="w">                </span><span class="n">Arrays</span><span class="p">.</span><span class="na">sort</span><span class="p">(</span><span class="n">nanos</span><span class="p">);</span>
+<span class="w">                </span><span class="kt">double</span><span class="w"> </span><span class="n">min</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">nanos</span><span class="o">[</span><span class="mi">0</span><span class="o">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="kt">double</span><span class="p">)</span><span class="w"> </span><span class="n">LONGS</span><span class="p">;</span>
+<span class="w">                </span><span class="kt">double</span><span class="w"> </span><span class="n">median</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">nanos</span><span class="o">[</span><span class="n">ROUNDS</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">2</span><span class="o">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="kt">double</span><span class="p">)</span><span class="w"> </span><span class="n">LONGS</span><span class="p">;</span>
+<span class="w">                </span><span class="n">System</span><span class="p">.</span><span class="na">out</span><span class="p">.</span><span class="na">printf</span><span class="p">(</span><span class="s">&quot;%-58s min %8.2f ns   median %8.2f ns%n&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">names</span><span class="o">[</span><span class="n">v</span><span class="o">]</span><span class="p">,</span><span class="w"> </span><span class="n">min</span><span class="p">,</span><span class="w"> </span><span class="n">median</span><span class="p">);</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">System</span><span class="p">.</span><span class="na">out</span><span class="p">.</span><span class="na">println</span><span class="p">();</span>
+<span class="w">        </span><span class="n">System</span><span class="p">.</span><span class="na">out</span><span class="p">.</span><span class="na">println</span><span class="p">(</span><span class="n">ok</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="s">&quot;all variants returned the expected sum&quot;</span><span class="w"> </span><span class="p">:</span><span class="w"> </span><span class="s">&quot;MISMATCH: a variant returned a wrong sum&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">ok</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">System</span><span class="p">.</span><span class="na">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre>
+<p>How to run it:</p>
+<pre class="code" data-language="sh"><code>javac<span class="w"> </span>-d<span class="w"> </span>out<span class="w"> </span>MemorySegmentRead.java
+java<span class="w"> </span>--enable-native-access<span class="o">=</span>ALL-UNNAMED<span class="w"> </span>-cp<span class="w"> </span>out<span class="w"> </span>MemorySegmentRead
+native-image<span class="w"> </span>--no-fallback<span class="w"> </span>-cp<span class="w"> </span>out<span class="w"> </span>-o<span class="w"> </span>msread<span class="w"> </span>MemorySegmentRead
+./msread
+</code></pre>
+</details>
+<hr><p>Corrections and questions are welcome as an <a href="https://github.com/Pragadeesh-19/nodusdb/issues">issue on GitHub</a>.</p>
+<hr>
+<p class="foot">Pragadeesh, London.</p>
+
+</body>
+</html>

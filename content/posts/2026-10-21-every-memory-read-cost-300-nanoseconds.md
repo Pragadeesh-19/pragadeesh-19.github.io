@@ -1,10 +1,9 @@
 ---
 title: Every memory read cost 300 nanoseconds
-date: 2026-11-10
+date: 2026-10-21
 description: How a GraalVM native image made my database's writes 40 times slower, why the compiler team had already fixed it, and what I measured when I tried the fix.
 slug: every-memory-read-cost-300-nanoseconds
 image: /img/og-300ns.png
-draft: true
 ---
 
 *How a GraalVM native image made my database's writes 40 times slower, why the compiler team had already fixed it, and what I measured when I tried the fix.*
