@@ -1,0 +1,11 @@
+{
+  "title": "Building NodusDB",
+  "description": "Essays on building NodusDB, an embedded database where the S3 bucket is the database. Systems engineering, written down honestly.",
+  "author": "Pragadeesh",
+  "language": "en",
+  "base_url": "https://pragadeesh-19.github.io",
+  "github": "https://github.com/Pragadeesh-19/nodusdb",
+  "pypi": "https://pypi.org/project/nodusdb/",
+  "default_image": "/img/og-default.png",
+  "custom_domain": ""
+}

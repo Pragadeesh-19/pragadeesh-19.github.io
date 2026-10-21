@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Building NodusDB</title><subtitle>Essays on building NodusDB, an embedded database where the S3 bucket is the database. Systems engineering, written down honestly.</subtitle><link href="https://pragadeesh-19.github.io/feed.xml" rel="self"/><link href="https://pragadeesh-19.github.io/"/><id>https://pragadeesh-19.github.io/</id><updated>2026-10-21T00:00:00Z</updated><author><name>Pragadeesh</name></author></feed>

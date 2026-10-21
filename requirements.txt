@@ -1,0 +1,2 @@
+markdown-it-py>=3.0
+Pygments>=2.17
