@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>A crash and a corrupt disk look the same | Building NodusDB</title>
+<meta name="description" content="How NodusDB&#x27;s log tells a power cut from a damaged disk, built from what write and fsync really promise, and what 2,858 simulated crashes did and did not prove.">
+<link rel="canonical" href="https://pragadeesh-19.github.io/posts/a-crash-and-a-corrupt-disk-look-the-same/">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="alternate" type="application/atom+xml" title="Building NodusDB" href="/feed.xml">
+<link rel="stylesheet" href="/style.css?v=455b503b">
+<meta property="og:site_name" content="Building NodusDB">
+<meta property="og:type" content="article">
+<meta property="og:title" content="A crash and a corrupt disk look the same">
+<meta property="og:description" content="How NodusDB&#x27;s log tells a power cut from a damaged disk, built from what write and fsync really promise, and what 2,858 simulated crashes did and did not prove.">
+<meta property="og:url" content="https://pragadeesh-19.github.io/posts/a-crash-and-a-corrupt-disk-look-the-same/">
+<meta property="og:image" content="https://pragadeesh-19.github.io/img/og-crash.png">
+<meta property="article:published_time" content="2026-10-28">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="A crash and a corrupt disk look the same">
+<meta name="twitter:description" content="How NodusDB&#x27;s log tells a power cut from a damaged disk, built from what write and fsync really promise, and what 2,858 simulated crashes did and did not prove.">
+<meta name="twitter:image" content="https://pragadeesh-19.github.io/img/og-crash.png">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "BlogPosting", "headline": "A crash and a corrupt disk look the same", "description": "How NodusDB's log tells a power cut from a damaged disk, built from what write and fsync really promise, and what 2,858 simulated crashes did and did not prove.", "url": "https://pragadeesh-19.github.io/posts/a-crash-and-a-corrupt-disk-look-the-same/", "image": "https://pragadeesh-19.github.io/img/og-crash.png", "author": {"@type": "Person", "name": "Pragadeesh"}, "datePublished": "2026-10-28"}</script>
+</head>
+<body>
+<p class="site"><a href="/">Building NodusDB</a></p>
+<p class="nav"><a href="/">Essays</a> | <a href="/about/">About</a> | <a href="https://github.com/Pragadeesh-19/nodusdb">GitHub</a></p>
+<hr>
+<h1>A crash and a corrupt disk look the same</h1><p><i>Pragadeesh, <time datetime="2026-10-28">28 October 2026</time></i></p><p><em>How NodusDB's log tells a power cut from a damaged disk, built from what write and fsync really promise, and what 2,858 simulated crashes did and did not prove.</em></p>
+<p>Every database log has a last record, and after a crash that record is sometimes half written. Its checksum fails.</p>
+<p>So what happened? Maybe the power went and the record was cut short. That is normal. You cut it off and carry on. Or maybe the disk is going bad and has damaged a record you were told was safe. That is not normal. You stop and tell a human.</p>
+<p>The bytes can be identical in both cases. The right actions are opposite. If you cut off data that was damaged, you silently lose commits you already promised. If you refuse to start after an ordinary power cut, you have built a database that fails at the one thing a log is for.</p>
+<p>This post is how NodusDB tells the two apart. I build the answer from one fact about disks, show the whole rule in a few lines of Java, and then test it against thousands of simulated crashes. While doing that I found a hole in my own test, and I'll show you that too.</p>
+<h2 id="start-with-what-a-write-does">Start with what a write does</h2>
+<p>When your program calls <code>write()</code>, the bytes go into the operating system's page cache, which is ordinary memory. The call returns. Nothing has reached the disk.</p>
+<p><code>fsync()</code> is the call that waits until the drive says the bytes are stored. Until it returns, you don't know where your bytes are.</p>
+<p><img src="/img/crash-writepath.png" alt="A diagram with three boxes: your program, the page cache, and the disk. A solid arrow from the program to the page cache is marked &quot;write() returns here, a power cut loses the bytes&quot;. A dashed arrow from the page cache to the disk is marked &quot;fsync() returns here, the bytes are on the disk&quot;." /></p>
+<p>Three things follow from this, and everything else in this post rests on them.</p>
+<ul>
+<li>Writes you haven't forced can be lost.</li>
+<li>They can be lost in any subset. The operating system and the drive write dirty data back in whatever order suits them, so after a power cut a later write can be on the disk while an earlier one is not.</li>
+<li>One write can be cut part-way. A record bigger than a sector can reach the disk in pieces.</li>
+</ul>
+<p>This is not a rare corner. A 2014 paper, <a href="https://research.cs.wisc.edu/adsl/Publications/alice-osdi14.html">All File Systems Are Not Created Equal</a>, built a tool called ALICE and used it on eleven widely used systems, including databases and key-value stores. It found 60 crash vulnerabilities: update code that is only correct if the file system behaves in one particular way. The file systems it tested differ in which of those behaviours they allow, so code that survives on one can break on another.</p>
+<h2 id="what-the-log-looks-like">What the log looks like</h2>
+<p>NodusDB keeps its changes in an append-only log of typed records. A record looks like this:</p>
+<pre class="code" data-language="text"><code>len u32 | type u8 | flags u8 | reserved u16 | lsn u64 | payload | crc32c
+</code></pre>
+<p>Records are 8-byte aligned, and the log is cut into segments of 64 MiB. The <code>lsn</code> is a position number that goes up by one for every record. A transaction is its records followed by a commit record, and recovery only ever applies whole transactions.</p>
+<p>In <code>sync</code> mode a write returns only after its records are forced to disk. Many callers can share one <code>fsync()</code>: a flusher thread collects whatever has arrived and forces it together. When a write returns, I call it acknowledged. The database has promised that it will survive.</p>
+<h2 id="what-a-checksum-can-and-cannot-tell-you">What a checksum can and cannot tell you</h2>
+<p>The CRC at the end of each record answers one question: do these bytes match what was written?</p>
+<p>It cannot say why they don't. A record cut short fails the check. A bit flipped by a failing drive fails it. A block of zeros where a record should be fails it. The result is the same and the causes are different, and recovery has to pick an action anyway.</p>
+<h2 id="two-rules-that-look-right">Two rules that look right</h2>
+<p><strong>Rule one: stop at the first bad record and keep everything before it.</strong> This is simple and often good enough. SQLite's write-ahead log works this way. <a href="https://www.sqlite.org/walformat.html">Its format document</a> says the scan &quot;stops at the end of the file or at the first invalid checksum&quot;, and the last valid commit frame decides what is kept. As I read it, a damaged frame in the middle ends the log right there, and the transactions after it are not recovered.</p>
+<p>RocksDB shows how real the choice is. It has <a href="https://javadoc.io/static/org.rocksdb/rocksdbjni/7.9.2/org/rocksdb/WALRecoveryMode.html">four WAL recovery modes</a>: one that expects no corruption at all, one that stops at the first inconsistency, one that tolerates a damaged tail, and one that skips any damaged record. A mature database that makes you pick tells me the question is hard.</p>
+<p><strong>Rule two: look at what comes after.</strong> If valid records follow the bad one, it must be corruption. If nothing valid follows, it is a torn tail. It feels clever, and I considered it. I threw it out for two reasons, both from my design notes.</p>
+<p>First, after a power cut a later write can persist while an earlier one is lost. A perfectly normal torn tail can contain a hole of zeros and then a good record after it. The scan would call that corruption and refuse to open after an ordinary crash.</p>
+<p>Second, the scan reads bytes that users wrote. NodusDB stores names in the log as strings, and a string can hold anything, including bytes shaped like a valid record. A rule that trusts what it finds in the log can be fooled by the data it is protecting. That second reason is my reasoning. I have not built an attack.</p>
+<h2 id="stop-reading-the-bytes-ask-what-you-knew">Stop reading the bytes. Ask what you knew.</h2>
+<p>Here is the move. Recovery doesn't have to guess from the content, because the writer knows something the content can't say: how far it has forced.</p>
+<p>When <code>fsync()</code> returns, every byte up to that point is on the disk, and a crash cannot tear it. So if the writer remembers that position durably, recovery can use it after a crash:</p>
+<ul>
+<li>A bad record <strong>before</strong> the position can't be explained by a crash. It is corruption. Refuse to open.</li>
+<li>A bad record <strong>at or after</strong> the position might be explained by a crash. Cut the log back to the last whole transaction and carry on.</li>
+</ul>
+<p>I call the remembered position the forced mark.</p>
+<p><img src="/img/crash-markrule.png" alt="Two rows of six records with a thick vertical line, the forced mark, after the fourth. In the first row the third record is bad, before the mark: those bytes were forced, so it is corruption and the database refuses to open. In the second row the sixth record is bad, after the mark: it is a torn tail, so the log is cut back to the last whole transaction." /></p>
+<p>That rule is the entire decision. This is the real code, with a few long lines broken to fit the page:</p>
+<pre class="code" data-language="java"><code><span class="kd">private</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">classifyDamage</span><span class="p">(</span><span class="n">Segment</span><span class="w"> </span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">Verdict</span><span class="w"> </span><span class="n">verdict</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">isBelowMark</span><span class="p">(</span><span class="n">segment</span><span class="p">.</span><span class="na">base</span><span class="p">(),</span><span class="w"> </span><span class="n">offset</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">String</span><span class="w"> </span><span class="n">detail</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">verdict</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">Verdict</span><span class="p">.</span><span class="na">INCOMPLETE</span>
+<span class="w">                </span><span class="o">?</span><span class="w"> </span><span class="s">&quot;the record is cut short&quot;</span><span class="w"> </span><span class="p">:</span><span class="w"> </span><span class="n">reader</span><span class="p">.</span><span class="na">invalidReason</span><span class="p">();</span>
+<span class="w">        </span><span class="k">throw</span><span class="w"> </span><span class="n">corrupt</span><span class="p">(</span><span class="n">segment</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span>
+<span class="w">                </span><span class="n">detail</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot; inside the part of the log known to be durable&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">stopped</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kd">private</span><span class="w"> </span><span class="kt">boolean</span><span class="w"> </span><span class="nf">isBelowMark</span><span class="p">(</span><span class="kt">long</span><span class="w"> </span><span class="n">segmentBase</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">offset</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">mark</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">mark</span><span class="p">.</span><span class="na">isAfter</span><span class="p">(</span><span class="n">segmentBase</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre>
+<p><code>stopped = true</code> means &quot;this is the end of the log&quot;. Recovery then truncates to the last commit point and deletes any later segments.</p>
+<h3 id="where-the-mark-lives">Where the mark lives</h3>
+<p>The mark has to survive a crash too, and writing it is itself a write that can be torn. So it is a small file with two slots of 32 bytes. Each slot holds a magic number, a sequence number, the segment, the offset, and a CRC32C over those fields. The writer alternates between the slots and forces the file after each write:</p>
+<pre class="code" data-language="java"><code><span class="kt">void</span><span class="w"> </span><span class="nf">record</span><span class="p">(</span><span class="kt">long</span><span class="w"> </span><span class="n">segmentBase</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">offset</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">IOException</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">sequence</span><span class="o">++</span><span class="p">;</span>
+<span class="w">    </span><span class="n">slot</span><span class="p">.</span><span class="na">clear</span><span class="p">();</span>
+<span class="w">    </span><span class="n">slot</span><span class="p">.</span><span class="na">putInt</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">MAGIC</span><span class="p">).</span><span class="na">putLong</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="n">sequence</span><span class="p">)</span>
+<span class="w">            </span><span class="p">.</span><span class="na">putLong</span><span class="p">(</span><span class="mi">12</span><span class="p">,</span><span class="w"> </span><span class="n">segmentBase</span><span class="p">).</span><span class="na">putLong</span><span class="p">(</span><span class="mi">20</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">);</span>
+<span class="w">    </span><span class="n">slot</span><span class="p">.</span><span class="na">putInt</span><span class="p">(</span><span class="n">CHECKSUM_OFFSET</span><span class="p">,</span><span class="w"> </span><span class="n">checksum</span><span class="p">(</span><span class="n">slot</span><span class="p">));</span>
+<span class="w">    </span><span class="n">channel</span><span class="p">.</span><span class="na">write</span><span class="p">(</span><span class="n">slot</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="n">sequence</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">SLOTS</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">SLOT_BYTES</span><span class="p">);</span>
+<span class="w">    </span><span class="n">channel</span><span class="p">.</span><span class="na">force</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre>
+<p>A torn write can damage only the slot being written. The other slot still holds the previous mark, and the reader takes the intact slot with the higher sequence number.</p>
+<p>The value of the mark has two rules.</p>
+<p><strong>It must never run ahead of the truth.</strong> The writer moves its in-memory position only after <code>fsync()</code> returns, and the mark file is written from that position later. If the mark ran ahead, bytes that never reached the disk would count as known to be durable, and a normal torn tail would look like corruption.</p>
+<p><strong>It may lag.</strong> Rewriting the mark costs another <code>fsync()</code>, so by default it is written about every 100 ms, not on every commit. An explicit <code>force()</code> and a <code>close()</code> write it straight away. Lagging is the safe direction. Bytes that are in fact safe are just treated as &quot;maybe&quot;, which gets the weaker answer.</p>
+<p>That is a trade, and it has a price. A bit flip inside the last 100 ms of forced data, followed by a crash before the mark catches up, is classed as a torn tail, so the log is cut there. Recovery reports how many bytes it cut, but it does not refuse to open. And if both slots of the mark file are damaged, there is no mark, and every bad record counts as a torn tail. I wrote the first gap down in my design notes as accepted. I think it is the right trade for now. It is still a trade.</p>
+<h2 id="when-fsync-itself-fails">When fsync itself fails</h2>
+<p>Recovery can't solve one more case. If <code>fsync()</code> returns an error, you no longer know what is on the disk. The tempting move is to retry.</p>
+<p>On Linux that can be wrong. After a failed write-back, the kernel can mark the dirty pages clean, so a second <code>fsync()</code> reports success for data that never reached the disk. That was behind the 2018 PostgreSQL bug, and PostgreSQL now <a href="https://wiki.postgresql.org/wiki/Fsync_Errors">panics on an fsync failure instead of retrying</a>. A 2020 study of ext4, XFS and Btrfs, <a href="https://www.usenix.org/conference/atc20/presentation/rebello">Can Applications Recover from fsync Failures?</a>, found that pages are always marked clean after a failure, and that none of the failure-handling strategies in the five applications it examined was sufficient.</p>
+<p>NodusDB never retries. The first failed force poisons the log:</p>
+<pre class="code" data-language="java"><code><span class="kd">private</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">fail</span><span class="p">(</span><span class="n">Exception</span><span class="w"> </span><span class="n">cause</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">synchronized</span><span class="w"> </span><span class="p">(</span><span class="n">monitor</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">failure</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">IndeterminateOutcomeException</span><span class="p">(</span>
+<span class="w">                </span><span class="s">&quot;the write-ahead log failed and its last records may or may not be durable; reopen the graph&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="n">cause</span><span class="p">);</span>
+<span class="w">        </span><span class="n">monitor</span><span class="p">.</span><span class="na">notifyAll</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre>
+<p>The write that was waiting gets that exception. So does every later append, force and close, until the graph is reopened. Recovery then reads what is actually on the disk and decides. A test, <code>aFailedForcePoisonsTheLogAndLaterWritesAreRefused</code>, makes forces fail on a simulated disk and checks all of this.</p>
+<h2 id="how-i-test-it-build-the-disk-a-power-cut-leaves">How I test it: build the disk a power cut leaves</h2>
+<p>You can't test this by pulling the plug. It is slow, you can't repeat it, and each pull shows you one outcome. So I wrote a disk that remembers.</p>
+<p>The idea is not mine. SQLite's tests use <a href="https://www.sqlite.org/testing.html">a virtual file system</a> that can &quot;make a snapshot of the entire filesystem after a set number of I/O operations&quot;, then revert to it and add &quot;random file damage&quot; of the kind a power loss leaves. TigerBeetle runs <a href="https://docs.tigerbeetle.com/concepts/safety/">a whole cluster in a simulator</a> and subjects it to network, storage and process faults. Mine is much smaller: one log, one file system.</p>
+<p><code>SimulatedDisk</code> stands in for the file system. It records every event: create, write, truncate, force, delete. Then <code>crashImage(eventsKept, pendingMask, lastWritePrefix)</code> builds the disk that a crash at that moment could leave:</p>
+<ul>
+<li>Everything up to each file's last force is durable.</li>
+<li>Writes after that are pending, and a bit mask picks which subset of them reached the disk.</li>
+<li>The last write can be cut at any byte prefix.</li>
+</ul>
+<p><img src="/img/crash-crashimage.png" alt="A flow of four steps: run a workload on a fake disk that records every write, force and truncate; pick a crash point by keeping only the first N events; build the disk the crash leaves from everything forced, any subset of the pending writes, and the last write cut at byte k; run recovery on that disk. Four checks follow." /></p>
+<p>The workload is 30 operations, a mix of single-tuple writes and batches of one to five tuples, in 2,048-byte segments so the log keeps rolling over to new files. It runs twice. In <code>sync</code> mode every write waits for its force. In <code>async</code> mode the test forces by hand after every seventh operation and at the end, and only commits covered by a force count as acknowledged.</p>
+<p>For every crash point the test builds six images with different subsets of pending writes: none, all, two alternating bit patterns, and two random ones. It adds many more with the last write torn. Then it runs recovery and checks four things:</p>
+<ol>
+<li>What comes back is a prefix of what was written.</li>
+<li>Every acknowledged commit is in it.</li>
+<li>The log takes a new write, and positions keep rising.</li>
+<li>Reopening again loses and repeats nothing.</li>
+</ol>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Run</th>
+<th style="text-align:right">Disk events</th>
+<th style="text-align:right">Times the mark was forced</th>
+<th style="text-align:right">Crash images</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Shipped test, sync</td>
+<td style="text-align:right">77</td>
+<td style="text-align:right">3</td>
+<td style="text-align:right">2,068</td>
+<td>pass</td>
+</tr>
+<tr>
+<td>Shipped test, async</td>
+<td style="text-align:right">34</td>
+<td style="text-align:right">7</td>
+<td style="text-align:right">790</td>
+<td>pass</td>
+</tr>
+</tbody>
+</table></div>
+<p>That is 2,858 simulated power cuts, replayed in about 10 seconds on my laptop. For these two workloads, under this disk model, no crash point loses an acknowledged commit, brings back something that isn't a prefix, or makes recovery refuse a legitimate crash.</p>
+<h2 id="what-that-does-not-prove">What that does not prove</h2>
+<p>I'd rather list the gaps myself.</p>
+<ul>
+<li><strong>Tears are not at every byte.</strong> In the sync run, writes up to 64 bytes are cut at every byte. Larger writes, and the whole async run, are cut at every 13th byte.</li>
+<li><strong>A write is only cut as a prefix.</strong> A real device can keep a later sector of one write and lose an earlier one. The subset mask covers different writes reaching the disk out of order, not the inside of a single write.</li>
+<li><strong>Creating and deleting files counts as durable at once.</strong> Real file systems need a directory sync, and the simulator never checks that I do one at the right moments.</li>
+<li><strong>A drive that lies about <code>fsync()</code> is not modelled.</strong></li>
+<li><strong>There are no bit flips in these runs.</strong> Separate tests cover that side: flipping a bit inside forced data, cutting a record short inside it, shortening the log to below the mark, and deleting a segment from the middle must each refuse to open.</li>
+<li><strong>Thirty operations is small.</strong></li>
+</ul>
+<h2 id="the-mark-barely-moved">The mark barely moved</h2>
+<p>The gap that bothered me most I found only by counting. The mark is driven by a timer of about 100 ms, and the simulated workload finishes in a few milliseconds. So I counted how often the mark file was forced during each run. Three times in the sync run: on open, when the writer starts, and on close. Seven times in the async run, which adds my four manual forces.</p>
+<p>That means that for all 30 writes of the sync run the mark sat at the very start of the log. Nearly every crash image was testing the torn-tail path. The half of the rule that says &quot;before the mark is corruption&quot; was barely in play.</p>
+<p>So I wrote a variant of the same test with the flush and mark intervals set to 1 ms and a 4 ms pause between operations, so that the mark moves while the workload runs.</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Run</th>
+<th style="text-align:right">Disk events</th>
+<th style="text-align:right">Times the mark was forced</th>
+<th style="text-align:right">Crash images</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Variant, sync</td>
+<td style="text-align:right">138</td>
+<td style="text-align:right">33</td>
+<td style="text-align:right">4,354</td>
+<td>pass</td>
+</tr>
+<tr>
+<td>Variant, async</td>
+<td style="text-align:right">61</td>
+<td style="text-align:right">8</td>
+<td style="text-align:right">992</td>
+<td>pass</td>
+</tr>
+</tbody>
+</table></div>
+<p>With the mark moving, 5,346 more crash images found no failure. The design holds up.</p>
+<p>The next question is the one that matters: would the shipped test notice if the mark were wrong? I broke the code on purpose, in a scratch copy. I changed one line so that the mark records where the writer has written, not where it has forced. That is the &quot;ahead of the truth&quot; bug from earlier.</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Test</th>
+<th>With the bug</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>The shipped crash test</td>
+<td>passes</td>
+</tr>
+<tr>
+<td>All 2,640 tests in the core module</td>
+<td>none about the log fails</td>
+</tr>
+<tr>
+<td>My variant</td>
+<td>fails, in the async run</td>
+</tr>
+</tbody>
+</table></div>
+<p>In that full run 16 tests failed and 41 were skipped. All 16 failures are tests that call a Python helper script, and my scratch run could not find Python. None of them touches the log.</p>
+<p>The failure my variant gave is the one a user would see, a database that refuses to open after an ordinary power cut:</p>
+<pre class="code" data-language="text"><code>CorruptLogException: the log ends at segment 00000000000000000056.nlog
+offset 32 but data up to segment 56 offset 72 was known to be durable
+</code></pre>
+<p>I also checked the other direction. I made recovery ignore the mark, so that every bad record counts as a torn tail. Both crash tests passed again, the shipped one and my variant. Two targeted tests failed: <code>damageInsideForcedDataRefusesToOpen</code> and <code>aRecordCutShortInsideForcedDataRefusesToOpen</code>. So the crash test guards one half of the rule, those two tests guard the other half, and nothing guarded the mark running ahead.</p>
+<p>So the test I had been quoting was real, and weaker than it looked. A timer-driven feature, exercised by a run that is over before the timer fires, was barely tested. I have pushed the variant to a branch of the repository. The link is at the end.</p>
+<h2 id="what-i-d-keep-from-this">What I'd keep from this</h2>
+<p><strong>Don't classify damage by looking at the damage.</strong> Remember what you knew when it happened.</p>
+<p><strong>A passing test is only as good as the bugs it can fail on.</strong> Break the code on purpose and see what notices.</p>
+<p><strong>Count what your test exercises.</strong> I trusted the number of crash images. The number that mattered was how many times the mark moved.</p>
+<h2 id="try-it-or-help">Try it, or help</h2>
+<p>The test is in the repository, <a href="https://github.com/Pragadeesh-19/nodusdb">github.com/Pragadeesh-19/nodusdb</a>, as <code>core/src/test/java/io/nodusdb/log/CrashExplorationTest.java</code>. The moving-mark variant is on the branch <a href="https://github.com/Pragadeesh-19/nodusdb/tree/test/crash-exploration-moving-mark"><code>test/crash-exploration-moving-mark</code></a>. The same branch corrects the README and four guides, which said torn writes are cut at every byte. With JDK 22 or newer and Maven, <code>mvn -pl core test -Dtest=CrashExplorationTest</code> runs the test, on main or on that branch. NodusDB is open source under Apache 2.0.</p>
+<p>Two questions I would like help with:</p>
+<ul>
+<li><strong>Have you seen a drive or file system that keeps the later part of a single write and loses the earlier part?</strong> My simulator only cuts a write at a prefix. If you have seen the other kind, I would like to know what it was and how you found it.</li>
+<li><strong>Is a lazy mark the right trade?</strong> Writing the mark after every group commit closes the 100 ms gap and costs one more <code>fsync()</code> per commit. Keeping it lazy is cheaper and leaves the gap. I chose lazy. Tell me if you would choose the other way.</li>
+</ul>
+<p>Last time I said the next post would be about writing the log straight into an Iceberg table. It needs this one first: a table built from a log can only be as good as the log. So that is next.</p>
+<hr><p>Corrections and questions are welcome as an <a href="https://github.com/Pragadeesh-19/nodusdb/issues">issue on GitHub</a>.</p>
+<hr>
+<p class="foot">Pragadeesh, London.</p>
+
+</body>
+</html>

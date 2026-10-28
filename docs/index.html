@@ -29,7 +29,7 @@
 <hr>
 <p>NodusDB is an embedded database for Python. You install it with <code>pip install nodusdb</code> and it runs inside your process, with no server to set up. It keeps its state in memory, so reads take microseconds, and it can ship its log to an S3 bucket, where the same log is also an Iceberg table. It is open source under the Apache License 2.0.</p>
 <p>I'm Pragadeesh. I write here about how it works and what goes wrong while I build it.</p>
-<h2>Essays</h2><ul><li><a href="/posts/every-memory-read-cost-300-nanoseconds/">Every memory read cost 300 nanoseconds</a>, <time datetime="2026-10-21">21 October 2026</time><br>How a GraalVM native image made my database&#x27;s writes 40 times slower, why the compiler team had already fixed it, and what I measured when I tried the fix.</li></ul>
+<h2>Essays</h2><ul><li><a href="/posts/a-crash-and-a-corrupt-disk-look-the-same/">A crash and a corrupt disk look the same</a>, <time datetime="2026-10-28">28 October 2026</time><br>How NodusDB&#x27;s log tells a power cut from a damaged disk, built from what write and fsync really promise, and what 2,858 simulated crashes did and did not prove.</li><li><a href="/posts/every-memory-read-cost-300-nanoseconds/">Every memory read cost 300 nanoseconds</a>, <time datetime="2026-10-21">21 October 2026</time><br>How a GraalVM native image made my database&#x27;s writes 40 times slower, why the compiler team had already fixed it, and what I measured when I tried the fix.</li></ul>
 <hr>
 <p class="foot">Pragadeesh, London.</p>
 
